@@ -43,7 +43,7 @@ async def _create_indexes():
         partialFilterExpression={"sourceId": {"$type": "string", "$gt": ""}},
     )
     await _safe_create_index(db.applications, "userId")
-    await _safe_create_index(db.applications, [("userId", 1), ("jobId", 1)])
+    # Existing DBs may already have a partial unique index with this auto name.
     await _safe_create_index(db.aievaluations, "userId")
     await _safe_create_index(db.automationruns, "userId")
     await _safe_create_index(db.automationlogs, [("userId", 1), ("createdAt", -1)])

@@ -20,6 +20,18 @@ from app.database import connect_db, disconnect_db
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await connect_db()
+    try:
+        from datetime import datetime, timezone
+        from app.database import get_db
+        db = get_db()
+        if db is not None:
+            now = datetime.now(timezone.utc).isoformat()
+            await db.automationruns.update_many(
+                {"status": {"$in": ["RUNNING", "PAUSED"]}},
+                {"$set": {"status": "ERROR", "error": "Server restarted", "finishedAt": now}},
+            )
+    except Exception as e:
+        print(f"⚠️  Could not reset stale automation runs: {e}")
     yield
     await disconnect_db()
 

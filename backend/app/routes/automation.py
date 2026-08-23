@@ -230,7 +230,8 @@ async def _run_automation(user_id: str, run_id: str, search: dict):
     """
     import sys
     from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+    # ApplyIQ repo root (not backend/) so core/ and utils/ import
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
     db = get_db()
     now = datetime.now(timezone.utc).isoformat()
@@ -259,6 +260,15 @@ async def _run_automation(user_id: str, run_id: str, search: dict):
         resume_path = resume["storageKey"] if resume else ""
 
         roles = search.get("roles", [])
+        if not roles:
+            await log("error", "[AUTOMATION] This search has no roles configured. Edit the search and add at least one role.")
+            await update_run({
+                "status": "ERROR",
+                "error": "No roles on this job search",
+                "finishedAt": datetime.now(timezone.utc).isoformat(),
+            })
+            return
+
         global_sent = 0
         global_max = search.get("globalMaxApplications", 50)
         mode = search.get("applicationMode", "AUTO_APPLY")
@@ -289,9 +299,12 @@ async def _run_automation(user_id: str, run_id: str, search: dict):
                 query = role.get("query", role.get("title", ""))
                 profile_dir = search.get("_profileDir") or LINKEDIN_PROFILE_DIR
                 await log("info", f"[BROWSER] Opening LinkedIn for {role.get('title', '')}…")
+                await log("info", "[BROWSER] A Chromium window should appear. Log into LinkedIn if asked.")
+                print(f"[automation] scrape start role={role.get('title')} query={query}", flush=True)
                 scrape = await asyncio.to_thread(
-                    scrape_role_posts, query, profile_dir, SCROLL_ROUNDS
+                    scrape_role_posts, query, str(profile_dir), SCROLL_ROUNDS
                 )
+                print(f"[automation] scrape result ok={scrape.get('ok')} err={scrape.get('error')}", flush=True)
                 if not scrape.get("ok"):
                     await log("error", f"[BROWSER] Automation error: {scrape.get('error', 'unknown')[:300]}")
                     await update_run({
