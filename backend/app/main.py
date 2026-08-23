@@ -1,9 +1,14 @@
 """ApplyIQ — FastAPI Backend"""
 import sys
+import asyncio
 from pathlib import Path
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+
+# Windows: Playwright needs a Proactor loop to spawn the browser process.
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 # Add project root for existing code imports
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent

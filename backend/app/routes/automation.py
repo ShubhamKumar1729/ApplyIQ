@@ -119,6 +119,17 @@ async def start_automation(req: AutomationStartRequest, user=Depends(get_current
 
     # Start background task
     task = asyncio.create_task(_run_automation(uid, run_id, search))
+
+    def _on_done(t: asyncio.Task):
+        _active_runs.pop(run_id, None)
+        try:
+            exc = t.exception()
+        except asyncio.CancelledError:
+            return
+        if exc:
+            print(f"Automation run {run_id} failed: {exc}")
+
+    task.add_done_callback(_on_done)
     _active_runs[run_id] = task
 
     return APIResponse(data={"runId": run_id, "status": "RUNNING"})
@@ -270,317 +281,276 @@ async def _run_automation(user_id: str, run_id: str, search: dict):
                 await asyncio.sleep(2)
                 run = await db.automationruns.find_one({"_id": ObjectId(run_id)})
 
-            # ── Search LinkedIn using existing Playwright code ──
+            # ── Search LinkedIn (sync Playwright in a thread — Windows-safe) ──
             try:
-                from playwright.async_api import async_playwright
+                from app.config import LINKEDIN_PROFILE_DIR, SCROLL_ROUNDS
+                from app.services.linkedin_scrape import scrape_role_posts
 
-                async with async_playwright() as pw:
-                    browser = await pw.chromium.launch_persistent_context(
-                        user_data_dir=search.get("_profileDir", "linkedin_profile_data"),
-                        headless=False,
-                        viewport={"width": 1400, "height": 900},
-                    )
-                    page = browser.pages[0] if browser.pages else await browser.new_page()
+                query = role.get("query", role.get("title", ""))
+                profile_dir = search.get("_profileDir") or LINKEDIN_PROFILE_DIR
+                await log("info", f"[BROWSER] Opening LinkedIn for {role.get('title', '')}…")
+                scrape = await asyncio.to_thread(
+                    scrape_role_posts, query, profile_dir, SCROLL_ROUNDS
+                )
+                if not scrape.get("ok"):
+                    await log("error", f"[BROWSER] Automation error: {scrape.get('error', 'unknown')[:300]}")
+                    await update_run({
+                        "status": "ERROR",
+                        "error": (scrape.get("error") or "Playwright failed")[:500],
+                        "finishedAt": datetime.now(timezone.utc).isoformat(),
+                    })
+                    return
 
-                    await log("info", f"[BROWSER] Opening LinkedIn for {role.get('title', '')}…")
+                posts = scrape.get("posts") or []
+                await log("info", "[SEARCH] Search page loaded")
+                await log("info", f"[SEARCH] Found {len(posts)} posts with recruiter emails")
 
-                    # Navigate to search
-                    from urllib.parse import quote
-                    query = role.get("query", role.get("title", ""))
-                    search_url = (
-                        f"https://www.linkedin.com/search/results/content/"
-                        f"?keywords={quote(query)}&sortBy=date_posted"
-                    )
-                    await page.goto(search_url, timeout=30000)
-                    await page.wait_for_timeout(4000)
-                    await log("info", "[SEARCH] Search page loaded")
+                for post in posts:
+                    if global_sent >= global_max:
+                        await log("info", "[LIMIT] Global application limit reached")
+                        await update_run({"status": "COMPLETED", "finishedAt": datetime.now(timezone.utc).isoformat()})
+                        return
 
-                    # Scroll and collect posts
-                    for scroll_round in range(8):
-                        await page.mouse.wheel(0, 1800)
-                        await page.wait_for_timeout(900)
+                    if role_sent >= role_max:
+                        await log("info", f"[LIMIT] Role limit reached ({role_max})")
+                        break
 
-                    await log("info", "[SCROLL] Loading more jobs")
-
-                    # Extract cards with emails
-                    from utils.helpers import extract_emails, clean
-                    from core.filters import should_send_to_post, filter_recruiter_emails
-
-                    cards = await page.locator("div.feed-shared-update-v2").all()
-                    await log("info", f"[SEARCH] Found {len(cards)} visible posts")
-
-                    for idx, card in enumerate(cards):
-                        # Check limits
-                        if global_sent >= global_max:
-                            await log("info", "[LIMIT] Global application limit reached")
-                            await update_run({"status": "COMPLETED", "finishedAt": datetime.now(timezone.utc).isoformat()})
-                            await browser.close()
-                            return
-
-                        if role_sent >= role_max:
-                            await log("info", f"[LIMIT] Role limit reached ({role_max})")
-                            break
-
-                        # Check pause
+                    run = await db.automationruns.find_one({"_id": ObjectId(run_id)})
+                    if run.get("status") == "STOPPED":
+                        break
+                    while run.get("status") == "PAUSED":
+                        await asyncio.sleep(2)
                         run = await db.automationruns.find_one({"_id": ObjectId(run_id)})
-                        if run.get("status") == "STOPPED":
-                            break
-                        while run.get("status") == "PAUSED":
-                            await asyncio.sleep(2)
-                            run = await db.automationruns.find_one({"_id": ObjectId(run_id)})
 
-                        try:
-                            text = clean(await card.inner_text(timeout=2000))
-                            if len(text) < 40:
-                                continue
-
-                            # Extract emails
-                            emails = filter_recruiter_emails(extract_emails(text))
-                            if not emails:
-                                continue
-
-                            # Gate: filter post
-                            allowed, reason = should_send_to_post(text)
-                            if not allowed:
-                                await log("warn", f"[SKIP] Junk/non-genuine post: {reason}")
-                                await db.automationruns.update_one(
-                                    {"_id": ObjectId(run_id)},
-                                    {"$inc": {"skippedCount": 1}},
-                                )
-                                continue
-
-                            await update_run({"jobsFound": global_sent + role_sent + 1})
-
-                            for email in emails[:5]:  # Max 5 per post
-                                if global_sent >= global_max or role_sent >= role_max:
-                                    break
-
-                                # Duplicate check
-                                existing_app = await db.applications.find_one({
-                                    "userId": user_id,
-                                    "recruiterEmail": email,
-                                    "status": {"$ne": "SKIPPED"},
-                                })
-                                if existing_app:
-                                    await log("info", f"[SKIP] Duplicate application skipped: {email}")
-                                    continue
-
-                                # Store job
-                                job_data = {
-                                    "userId": user_id,
-                                    "searchId": search.get("_id") and str(search["_id"]),
-                                    "source": "linkedin",
-                                    "sourceId": f"linkedin-post-{hash(text[:200])}-{email}",
-                                    "title": role.get("title", ""),
-                                    "company": "",
-                                    "location": role.get("location", ""),
-                                    "description": text[:5000],
-                                    "url": "",
-                                    "recruiterEmail": email,
-                                    "recruiterName": "",
-                                    "raw": {"postText": text[:2000]},
-                                    "createdAt": datetime.now(timezone.utc).isoformat(),
-                                }
-
-                                try:
-                                    job_result = await db.jobs.insert_one(job_data)
-                                    job_id = str(job_result.inserted_id)
-                                except Exception:
-                                    # Duplicate sourceId
-                                    existing_job = await db.jobs.find_one({
-                                        "userId": user_id, "sourceId": job_data["sourceId"]
-                                    })
-                                    if existing_job:
-                                        job_id = str(existing_job["_id"])
-                                    else:
-                                        continue
-
-                                await log("info", f"[JOB] Found: {role.get('title', '')} - {email}")
-                                await log("info", f"[EMAIL] Recruiter email found: {email}")
-
-                                # AI Evaluation
-                                await log("info", "[AI] Sending complete job data to Groq…")
-                                from app.services.ai_service import evaluate_relevance
-                                eval_result = evaluate_relevance(
-                                    candidate=profile,
-                                    role=role,
-                                    job_title=role.get("title", ""),
-                                    company="",
-                                    location=role.get("location", ""),
-                                    description=text,
-                                    resume_text=resume.get("extractedText", "") if resume else "",
-                                )
-
-                                # Store evaluation
-                                await db.aievaluations.insert_one({
-                                    "userId": user_id,
-                                    "jobId": job_id,
-                                    "searchId": search.get("_id") and str(search["_id"]),
-                                    "relevant": eval_result["relevant"],
-                                    "score": eval_result["score"],
-                                    "confidence": eval_result["confidence"],
-                                    "reason": eval_result["reason"],
-                                    "matchingSkills": eval_result["matchingSkills"],
-                                    "missingRequirements": eval_result["missingRequirements"],
-                                    "createdAt": datetime.now(timezone.utc).isoformat(),
-                                })
-
-                                score_emoji = "✅" if eval_result["relevant"] else "❌"
-                                await log("success" if eval_result["relevant"] else "warn",
-                                          f"[AI] Relevance score: {eval_result['score']} — {score_emoji} {eval_result['reason'][:100]}")
-
-                                if not eval_result["relevant"] or eval_result["score"] < ai_threshold:
-                                    await log("info", "[AI] Decision: NOT RELEVANT — skipping")
-                                    await db.applications.insert_one({
-                                        "userId": user_id, "jobId": job_id,
-                                        "searchId": search.get("_id") and str(search["_id"]),
-                                        "roleKey": role_key, "runId": run_id,
-                                        "status": "SKIPPED",
-                                        "matchScore": eval_result["score"],
-                                        "aiReason": eval_result["reason"],
-                                        "recruiterEmail": email,
-                                        "mode": mode,
-                                        "createdAt": datetime.now(timezone.utc).isoformat(),
-                                    })
-                                    await db.automationruns.update_one(
-                                        {"_id": ObjectId(run_id)},
-                                        {"$inc": {"skippedCount": 1, "jobsEvaluated": 1}},
-                                    )
-                                    continue
-
-                                await db.automationruns.update_one(
-                                    {"_id": ObjectId(run_id)},
-                                    {"$inc": {"relevantCount": 1, "jobsEvaluated": 1}},
-                                )
-
-                                # Resume customization
-                                resume_to_use = resume_path
-                                if customize and resume:
-                                    await log("info", "[RESUME] Customizing resume for this job…")
-                                    from app.services.ai_service import customize_resume
-                                    custom = customize_resume(
-                                        resume_text=resume.get("extractedText", ""),
-                                        job_description=text,
-                                        job_title=role.get("title", ""),
-                                        candidate=profile,
-                                    )
-                                    # Store version
-                                    ver_result = await db.resumeversions.insert_one({
-                                        "userId": user_id,
-                                        "resumeId": str(resume["_id"]),
-                                        "label": f"Tailored — {role.get('title', '')}",
-                                        "jobId": job_id,
-                                        "jobTitle": role.get("title", ""),
-                                        "createdBy": "ai",
-                                        "tailoredText": custom["tailoredText"],
-                                        "summaryOfChanges": custom["summaryOfChanges"],
-                                        "createdAt": datetime.now(timezone.utc).isoformat(),
-                                    })
-                                    resume_version_id = str(ver_result.inserted_id)
-                                    await log("success", f"[RESUME] Tailored resume prepared")
-                                else:
-                                    resume_version_id = None
-
-                                # Generate message
-                                from app.services.ai_service import generate_application_message
-                                message = generate_application_message(
-                                    candidate=profile,
-                                    job_title=role.get("title", ""),
-                                    company="",
-                                    recruiter_name="",
-                                    description=text,
-                                    matching_skills=eval_result.get("matchingSkills", []),
-                                )
-
-                                subject = (
-                                    f"{role.get('title', 'Position')} | "
-                                    f"{profile.get('fullName', 'Applicant')} | "
-                                    f"{profile.get('experience', '')} | "
-                                    f"{profile.get('workAuthorization', '')} | Immediate"
-                                )
-
-                                # Create application record
-                                app_data = {
-                                    "userId": user_id,
-                                    "jobId": job_id,
-                                    "searchId": search.get("_id") and str(search["_id"]),
-                                    "roleKey": role_key,
-                                    "runId": run_id,
-                                    "status": "PREPARED",
-                                    "matchScore": eval_result["score"],
-                                    "aiReason": eval_result["reason"],
-                                    "emailSubject": subject,
-                                    "emailBody": message,
-                                    "recruiterEmail": email,
-                                    "ccEmails": search.get("ccEmails", []),
-                                    "bccEmails": search.get("bccEmails", []),
-                                    "resumeVersionId": resume_version_id,
-                                    "resumePath": resume_to_use,
-                                    "pendingApproval": mode == "REVIEW",
-                                    "mode": mode,
-                                    "createdAt": datetime.now(timezone.utc).isoformat(),
-                                }
-
-                                # Mode handling
-                                if mode == "TEST":
-                                    app_data["status"] = "PREPARED"
-                                    await log("info", "[TEST] Prepared application — not sent")
-                                    await db.applications.insert_one(app_data)
-                                elif mode == "REVIEW":
-                                    app_data["status"] = "PREPARED"
-                                    app_data["pendingApproval"] = True
-                                    await log("info", "[REVIEW] Application prepared — awaiting approval")
-                                    await db.applications.insert_one(app_data)
-                                    await _notify_ws(user_id, {"type": "review_needed", "applicationId": "", "email": email})
-                                else:
-                                    # AUTO_APPLY — send email
-                                    await log("info", "[EMAIL] Sending application…")
-                                    from app.services.email_adapter import send_application_email
-                                    result = send_application_email(
-                                        to_email=email,
-                                        subject=subject,
-                                        body=message,
-                                        resume_path=resume_to_use,
-                                        cc_emails=search.get("ccEmails", []),
-                                        bcc_emails=search.get("bccEmails", []),
-                                        user_email=user.get("email", "") if hasattr(user, "get") else profile.get("email", ""),
-                                    )
-                                    if result["success"]:
-                                        app_data["status"] = "EMAIL_SENT"
-                                        app_data["sentAt"] = datetime.now(timezone.utc).isoformat()
-                                        await log("success", f"[EMAIL] Application sent successfully to {email}")
-                                    else:
-                                        app_data["status"] = "FAILED"
-                                        app_data["error"] = result.get("error", "")
-                                        await log("error", f"[EMAIL] Send failed: {result.get('error', '')}")
-
-                                    await db.applications.insert_one(app_data)
-
-                                if app_data["status"] == "EMAIL_SENT":
-                                    global_sent += 1
-                                    role_sent += 1
-                                    await db.automationruns.update_one(
-                                        {"_id": ObjectId(run_id)},
-                                        {"$inc": {"applicationsSent": 1}},
-                                    )
-                                    await _notify_ws(user_id, {
-                                        "type": "application_sent",
-                                        "email": email,
-                                        "total": global_sent,
-                                    })
-
-                                # Pacing
-                                await asyncio.sleep(search.get("sendingPacingMs", 4000) / 1000)
-
-                        except Exception as e:
-                            await log("error", f"[ERROR] Card processing error: {str(e)[:200]}")
+                    try:
+                        text = post.get("text") or ""
+                        emails = post.get("emails") or []
+                        if not post.get("allowed", True):
+                            await log("warn", f"[SKIP] Junk/non-genuine post: {post.get('skipReason', '')}")
                             await db.automationruns.update_one(
                                 {"_id": ObjectId(run_id)},
-                                {"$inc": {"failedCount": 1}},
+                                {"$inc": {"skippedCount": 1}},
                             )
                             continue
 
-                    await browser.close()
+                        await update_run({"jobsFound": global_sent + role_sent + 1})
+
+                        for email in emails[:5]:
+                            if global_sent >= global_max or role_sent >= role_max:
+                                break
+
+                            existing_app = await db.applications.find_one({
+                                "userId": user_id,
+                                "recruiterEmail": email,
+                                "status": {"$ne": "SKIPPED"},
+                            })
+                            if existing_app:
+                                await log("info", f"[SKIP] Duplicate application skipped: {email}")
+                                continue
+
+                            job_data = {
+                                "userId": user_id,
+                                "searchId": search.get("_id") and str(search["_id"]),
+                                "source": "linkedin",
+                                "sourceId": f"linkedin-post-{hash(text[:200])}-{email}",
+                                "title": role.get("title", ""),
+                                "company": "",
+                                "location": role.get("location", ""),
+                                "description": text[:5000],
+                                "url": "",
+                                "recruiterEmail": email,
+                                "recruiterName": "",
+                                "raw": {"postText": text[:2000]},
+                                "createdAt": datetime.now(timezone.utc).isoformat(),
+                            }
+
+                            try:
+                                job_result = await db.jobs.insert_one(job_data)
+                                job_id = str(job_result.inserted_id)
+                            except Exception:
+                                existing_job = await db.jobs.find_one({
+                                    "userId": user_id, "sourceId": job_data["sourceId"]
+                                })
+                                if existing_job:
+                                    job_id = str(existing_job["_id"])
+                                else:
+                                    continue
+
+                            await log("info", f"[JOB] Found: {role.get('title', '')} - {email}")
+                            await log("info", f"[EMAIL] Recruiter email found: {email}")
+
+                            await log("info", "[AI] Sending complete job data to Groq…")
+                            from app.services.ai_service import evaluate_relevance
+                            eval_result = evaluate_relevance(
+                                candidate=profile,
+                                role=role,
+                                job_title=role.get("title", ""),
+                                company="",
+                                location=role.get("location", ""),
+                                description=text,
+                                resume_text=resume.get("extractedText", "") if resume else "",
+                            )
+
+                            await db.aievaluations.insert_one({
+                                "userId": user_id,
+                                "jobId": job_id,
+                                "searchId": search.get("_id") and str(search["_id"]),
+                                "relevant": eval_result["relevant"],
+                                "score": eval_result["score"],
+                                "confidence": eval_result["confidence"],
+                                "reason": eval_result["reason"],
+                                "matchingSkills": eval_result["matchingSkills"],
+                                "missingRequirements": eval_result["missingRequirements"],
+                                "createdAt": datetime.now(timezone.utc).isoformat(),
+                            })
+
+                            score_emoji = "✅" if eval_result["relevant"] else "❌"
+                            await log("success" if eval_result["relevant"] else "warn",
+                                      f"[AI] Relevance score: {eval_result['score']} — {score_emoji} {eval_result['reason'][:100]}")
+
+                            if not eval_result["relevant"] or eval_result["score"] < ai_threshold:
+                                await log("info", "[AI] Decision: NOT RELEVANT — skipping")
+                                await db.applications.insert_one({
+                                    "userId": user_id, "jobId": job_id,
+                                    "searchId": search.get("_id") and str(search["_id"]),
+                                    "roleKey": role_key, "runId": run_id,
+                                    "status": "SKIPPED",
+                                    "matchScore": eval_result["score"],
+                                    "aiReason": eval_result["reason"],
+                                    "recruiterEmail": email,
+                                    "mode": mode,
+                                    "createdAt": datetime.now(timezone.utc).isoformat(),
+                                })
+                                await db.automationruns.update_one(
+                                    {"_id": ObjectId(run_id)},
+                                    {"$inc": {"skippedCount": 1, "jobsEvaluated": 1}},
+                                )
+                                continue
+
+                            await db.automationruns.update_one(
+                                {"_id": ObjectId(run_id)},
+                                {"$inc": {"relevantCount": 1, "jobsEvaluated": 1}},
+                            )
+
+                            resume_to_use = resume_path
+                            if customize and resume:
+                                await log("info", "[RESUME] Customizing resume for this job…")
+                                from app.services.ai_service import customize_resume
+                                custom = customize_resume(
+                                    resume_text=resume.get("extractedText", ""),
+                                    job_description=text,
+                                    job_title=role.get("title", ""),
+                                    candidate=profile,
+                                )
+                                ver_result = await db.resumeversions.insert_one({
+                                    "userId": user_id,
+                                    "resumeId": str(resume["_id"]),
+                                    "label": f"Tailored — {role.get('title', '')}",
+                                    "jobId": job_id,
+                                    "jobTitle": role.get("title", ""),
+                                    "createdBy": "ai",
+                                    "tailoredText": custom["tailoredText"],
+                                    "summaryOfChanges": custom["summaryOfChanges"],
+                                    "createdAt": datetime.now(timezone.utc).isoformat(),
+                                })
+                                resume_version_id = str(ver_result.inserted_id)
+                                await log("success", "[RESUME] Tailored resume prepared")
+                            else:
+                                resume_version_id = None
+
+                            from app.services.ai_service import generate_application_message
+                            message = generate_application_message(
+                                candidate=profile,
+                                job_title=role.get("title", ""),
+                                company="",
+                                recruiter_name="",
+                                description=text,
+                                matching_skills=eval_result.get("matchingSkills", []),
+                            )
+
+                            subject = (
+                                f"{role.get('title', 'Position')} | "
+                                f"{profile.get('fullName', 'Applicant')} | "
+                                f"{profile.get('experience', '')} | "
+                                f"{profile.get('workAuthorization', '')} | Immediate"
+                            )
+
+                            app_data = {
+                                "userId": user_id,
+                                "jobId": job_id,
+                                "searchId": search.get("_id") and str(search["_id"]),
+                                "roleKey": role_key,
+                                "runId": run_id,
+                                "status": "PREPARED",
+                                "matchScore": eval_result["score"],
+                                "aiReason": eval_result["reason"],
+                                "emailSubject": subject,
+                                "emailBody": message,
+                                "recruiterEmail": email,
+                                "ccEmails": search.get("ccEmails", []),
+                                "bccEmails": search.get("bccEmails", []),
+                                "resumeVersionId": resume_version_id,
+                                "resumePath": resume_to_use,
+                                "pendingApproval": mode == "REVIEW",
+                                "mode": mode,
+                                "createdAt": datetime.now(timezone.utc).isoformat(),
+                            }
+
+                            if mode == "TEST":
+                                app_data["status"] = "PREPARED"
+                                await log("info", "[TEST] Prepared application — not sent")
+                                await db.applications.insert_one(app_data)
+                            elif mode == "REVIEW":
+                                app_data["status"] = "PREPARED"
+                                app_data["pendingApproval"] = True
+                                await log("info", "[REVIEW] Application prepared — awaiting approval")
+                                await db.applications.insert_one(app_data)
+                                await _notify_ws(user_id, {"type": "review_needed", "applicationId": "", "email": email})
+                            else:
+                                await log("info", "[EMAIL] Sending application…")
+                                from app.services.email_adapter import send_application_email
+                                result = send_application_email(
+                                    to_email=email,
+                                    subject=subject,
+                                    body=message,
+                                    resume_path=resume_to_use,
+                                    cc_emails=search.get("ccEmails", []),
+                                    bcc_emails=search.get("bccEmails", []),
+                                    user_email=profile.get("email", ""),
+                                )
+                                if result["success"]:
+                                    app_data["status"] = "EMAIL_SENT"
+                                    app_data["sentAt"] = datetime.now(timezone.utc).isoformat()
+                                    await log("success", f"[EMAIL] Application sent successfully to {email}")
+                                else:
+                                    app_data["status"] = "FAILED"
+                                    app_data["error"] = result.get("error", "")
+                                    await log("error", f"[EMAIL] Send failed: {result.get('error', '')}")
+
+                                await db.applications.insert_one(app_data)
+
+                            if app_data["status"] == "EMAIL_SENT":
+                                global_sent += 1
+                                role_sent += 1
+                                await db.automationruns.update_one(
+                                    {"_id": ObjectId(run_id)},
+                                    {"$inc": {"applicationsSent": 1}},
+                                )
+                                await _notify_ws(user_id, {
+                                    "type": "application_sent",
+                                    "email": email,
+                                    "total": global_sent,
+                                })
+
+                            await asyncio.sleep(search.get("sendingPacingMs", 4000) / 1000)
+
+                    except Exception as e:
+                        await log("error", f"[ERROR] Card processing error: {str(e)[:200]}")
+                        await db.automationruns.update_one(
+                            {"_id": ObjectId(run_id)},
+                            {"$inc": {"failedCount": 1}},
+                        )
+                        continue
 
             except Exception as e:
                 await log("error", f"[BROWSER] Automation error: {str(e)[:300]}")
