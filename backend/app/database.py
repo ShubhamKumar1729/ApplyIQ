@@ -21,20 +21,34 @@ async def disconnect_db():
         client.close()
         print("✅ MongoDB disconnected")
 
+async def _safe_create_index(collection, keys, **kwargs):
+    try:
+        await collection.create_index(keys, **kwargs)
+    except Exception as e:
+        print(f"⚠️  Index skipped on {collection.name}: {e}")
+
+
 async def _create_indexes():
-    await db.users.create_index("email", unique=True)
-    await db.users.create_index("googleId", sparse=True)
-    await db.profiles.create_index("userId", unique=True)
-    await db.resumes.create_index([("userId", 1), ("isDefault", -1)])
-    await db.jobsearches.create_index("userId")
-    await db.jobs.create_index([("userId", 1), ("sourceId", 1)], unique=True)
-    await db.applications.create_index("userId")
-    await db.applications.create_index([("userId", 1), ("jobId", 1)])
-    await db.aievaluations.create_index("userId")
-    await db.automationruns.create_index("userId")
-    await db.automationlogs.create_index([("userId", 1), ("createdAt", -1)])
-    await db.notifications.create_index([("userId", 1), ("read", 1)])
-    await db.resumeversions.create_index("userId")
+    await _safe_create_index(db.users, "email", unique=True)
+    await _safe_create_index(db.users, "googleId", sparse=True)
+    await _safe_create_index(db.profiles, "userId", unique=True)
+    await _safe_create_index(db.resumes, [("userId", 1), ("isDefault", -1)])
+    await _safe_create_index(db.jobsearches, "userId")
+    # Partial unique: existing docs with sourceId=null would break a full unique index
+    await _safe_create_index(
+        db.jobs,
+        [("userId", 1), ("sourceId", 1)],
+        unique=True,
+        name="userId_1_sourceId_1_partial",
+        partialFilterExpression={"sourceId": {"$type": "string", "$gt": ""}},
+    )
+    await _safe_create_index(db.applications, "userId")
+    # Existing DBs may already have a partial unique index with this auto name.
+    await _safe_create_index(db.aievaluations, "userId")
+    await _safe_create_index(db.automationruns, "userId")
+    await _safe_create_index(db.automationlogs, [("userId", 1), ("createdAt", -1)])
+    await _safe_create_index(db.notifications, [("userId", 1), ("read", 1)])
+    await _safe_create_index(db.resumeversions, "userId")
 
 def get_db():
     return db
